@@ -1,0 +1,18 @@
+{
+  "name": "DEYGO — Help Dey Go",
+  "short_name": "DEYGO",
+  "description": "Nigeria's next-generation emergency response platform. One tap can save your life.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0e1a",
+  "theme_color": "#ef4444",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
