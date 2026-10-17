@@ -50,6 +50,7 @@ export interface SOSAlert {
   user_id: string;
   latitude: number | null;
   longitude: number | null;
+  location_status: string | null;
   status: SOSStatus;
   triggered_at: string;
   resolved_at: string | null;

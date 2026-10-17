@@ -32,6 +32,7 @@ import { Button } from '@/components/ui/button';
 type SOSState = 'idle' | 'countdown' | 'sending' | 'sent' | 'error';
 
 const SOS_TIMEOUT_MS = 15000;
+const GPS_TIMEOUT_MS = 4000;
 
 function withTimeout<T>(promise: PromiseLike<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -47,7 +48,7 @@ export default function SOSPage() {
   const [sosState, setSosState] = useState<SOSState>('idle');
   const [countdown, setCountdown] = useState(5);
   const [location, setLocation] = useState<{ lat: number; lng: number } | null>(null);
-  const [locationStatus, setLocationStatus] = useState<'pending' | 'acquired' | 'denied' | 'unavailable'>('pending');
+  const [locationStatus, setLocationStatus] = useState<'pending' | 'acquired' | 'denied' | 'timeout' | 'unavailable'>('pending');
   const [recentAlerts, setRecentAlerts] = useState<SOSAlert[]>([]);
   const [incidentId, setIncidentId] = useState<string | null>(null);
   const [activeIncident, setActiveIncident] = useState<EmergencyIncident | null>(null);
@@ -56,6 +57,7 @@ export default function SOSPage() {
   const [alertsLoading, setAlertsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
   const [resolving, setResolving] = useState<string | null>(null);
+  const pendingAlertIdRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -100,16 +102,36 @@ export default function SOSPage() {
       (pos) => {
         setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
         setLocationStatus('acquired');
+
+        // If alert was already saved without location, update it now
+        if (pendingAlertIdRef.current) {
+          const alertId = pendingAlertIdRef.current;
+          pendingAlertIdRef.current = null;
+          supabase
+            .from('sos_alerts')
+            .update({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+              location_status: 'acquired',
+            })
+            .eq('id', alertId)
+            .then(({ error }) => {
+              if (error) console.error('[SOS] Failed to update alert with late GPS:', error.message);
+            });
+        }
       },
       (err) => {
         setLocation(null);
+        pendingAlertIdRef.current = null;
         if (err.code === err.PERMISSION_DENIED) {
           setLocationStatus('denied');
+        } else if (err.code === err.TIMEOUT) {
+          setLocationStatus('timeout');
         } else {
           setLocationStatus('unavailable');
         }
       },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+      { enableHighAccuracy: true, timeout: GPS_TIMEOUT_MS, maximumAge: 30000 }
     );
   }, []);
 
@@ -135,6 +157,7 @@ export default function SOSPage() {
     setSosState('idle');
     setCountdown(5);
     setLocationStatus('pending');
+    pendingAlertIdRef.current = null;
   };
 
   const triggerSOS = async () => {
@@ -146,34 +169,31 @@ export default function SOSPage() {
     setSosState('sending');
     setErrorMessage('');
 
-    let alertCreated = false;
-    let incidentCreated = false;
+    // Determine location status for the payload
+    const locStatus =
+      locationStatus === 'acquired' ? 'acquired'
+      : locationStatus === 'denied' ? 'denied'
+      : locationStatus === 'unavailable' ? 'unavailable'
+      : 'GPS Timeout'; // pending or timeout means GPS didn't respond in time
 
-    // Step 1: Create SOS alert
+    // Step 1: Save SOS alert immediately — no strict timeout, this is the critical path
+    let alertId: string | null = null;
     try {
-      const { data: alertData, error: alertError } = await withTimeout<{
-        data: SOSAlert | null;
-        error: { message: string } | null;
-      }>(
-        supabase
-          .from('sos_alerts')
-          .insert({
-            user_id: user.id,
-            latitude: location?.lat || null,
-            longitude: location?.lng || null,
-            status: 'active',
-            is_duress: false,
-          })
-          .select()
-          .single(),
-        SOS_TIMEOUT_MS,
-        'SOS alert creation'
-      );
+      const { data, error } = await supabase
+        .from('sos_alerts')
+        .insert({
+          user_id: user.id,
+          latitude: location?.lat ?? null,
+          longitude: location?.lng ?? null,
+          location_status: locStatus,
+          status: 'active',
+          is_duress: false,
+        })
+        .select()
+        .single();
 
-      if (alertError || !alertData) {
-        throw new Error(alertError?.message || 'Failed to create SOS alert');
-      }
-      alertCreated = true;
+      if (error || !data) throw new Error(error?.message || 'Failed to create SOS alert');
+      alertId = data.id;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       setErrorMessage(`Failed to send SOS alert: ${msg}. Check your connection and try again.`);
@@ -181,77 +201,65 @@ export default function SOSPage() {
       return;
     }
 
-    // Step 2: Create emergency incident
-    try {
-      const incident = await withTimeout(
-        createEmergencyIncident({
+    // Show success screen immediately — the alert is saved
+    setSosState('sent');
+
+    // If GPS was still pending, set up late update when coordinates arrive
+    if (locationStatus === 'pending' && alertId) {
+      pendingAlertIdRef.current = alertId;
+    }
+
+    // Background tasks: incident creation, contact notification, history, refresh
+    // These run asynchronously and do not block the success screen
+    (async () => {
+      // Create emergency incident
+      try {
+        const incident = await createEmergencyIncident({
           userId: user.id,
           userEmail: user.email,
           emergencyType: 'sos',
           latitude: location?.lat ?? null,
           longitude: location?.lng ?? null,
-        }),
-        SOS_TIMEOUT_MS,
-        'Incident creation'
-      );
+        });
+        if (incident) {
+          setIncidentId(incident.id);
+          setActiveIncident(incident);
 
-      if (incident) {
-        setIncidentId(incident.id);
-        setActiveIncident(incident);
-        incidentCreated = true;
+          // Notify emergency contacts
+          try {
+            const contactResults = await notifyEmergencyContacts(user.id, incident);
+            setContactsNotified(contactResults.length);
+          } catch (err) {
+            console.error('Contact notification failed:', err);
+            setContactsNotified(0);
+          }
 
-        // Step 3: Notify emergency contacts
-        try {
-          const contactResults = await withTimeout(
-            notifyEmergencyContacts(user.id, incident),
-            SOS_TIMEOUT_MS,
-            'Contact notification'
-          );
-          setContactsNotified(contactResults.length);
-        } catch (err) {
-          console.error('Contact notification failed:', err);
-          setContactsNotified(0);
+          // Fetch status history
+          try {
+            const history = await getIncidentStatusHistory(incident.id);
+            setStatusHistory(history);
+          } catch (err) {
+            console.error('Status history fetch failed:', err);
+            setStatusHistory([]);
+          }
         }
-
-        // Step 4: Fetch status history
-        try {
-          const history = await withTimeout(
-            getIncidentStatusHistory(incident.id),
-            SOS_TIMEOUT_MS,
-            'Status history fetch'
-          );
-          setStatusHistory(history);
-        } catch (err) {
-          console.error('Status history fetch failed:', err);
-          setStatusHistory([]);
-        }
+      } catch (err) {
+        console.error('Incident creation failed:', err);
       }
-    } catch (err) {
-      console.error('Incident creation failed:', err);
-      // Alert was still created — proceed to sent state with partial info
-    }
 
-    // Step 5: Refresh recent alerts
-    try {
-      const { data: alerts } = await withTimeout<{
-        data: SOSAlert[] | null;
-        error: { message: string } | null;
-      }>(
-        supabase
+      // Refresh recent alerts list
+      try {
+        const { data: alerts } = await supabase
           .from('sos_alerts')
           .select('*')
           .eq('user_id', user.id)
           .order('created_at', { ascending: false })
-          .limit(10),
-        SOS_TIMEOUT_MS,
-        'Alert refresh'
-      );
-      setRecentAlerts((alerts || []) as SOSAlert[]);
-    } catch (err) {
-      console.error('Alert refresh failed:', err);
-    }
-
-    setSosState('sent');
+          .limit(10);
+        setRecentAlerts((alerts || []) as SOSAlert[]);
+      } catch (err) {
+        console.error('Alert refresh failed:', err);
+      }
+    })();
   };
 
   const resetSOS = () => {
@@ -263,6 +271,7 @@ export default function SOSPage() {
     setContactsNotified(0);
     setErrorMessage('');
     setLocationStatus('pending');
+    pendingAlertIdRef.current = null;
   };
 
   const resolveAlert = async (id: string) => {
@@ -330,6 +339,7 @@ export default function SOSPage() {
   const locationLabel =
     locationStatus === 'acquired' ? 'GPS Captured'
     : locationStatus === 'denied' ? 'GPS Denied'
+    : locationStatus === 'timeout' ? 'GPS Timeout'
     : locationStatus === 'unavailable' ? 'GPS Unavailable'
     : 'GPS Pending';
 
@@ -428,6 +438,8 @@ export default function SOSPage() {
                     ? 'GPS location captured. Sending alert...'
                     : locationStatus === 'denied'
                     ? 'GPS permission denied. Sending without location...'
+                    : locationStatus === 'timeout'
+                    ? 'GPS timed out. Sending without location...'
                     : locationStatus === 'unavailable'
                     ? 'GPS unavailable. Sending without location...'
                     : 'Acquiring GPS location...'}
@@ -473,7 +485,7 @@ export default function SOSPage() {
                       className="glass-card flex items-center gap-2 rounded-full px-3 py-1.5"
                     >
                       <item.icon className={`h-4 w-4 ${
-                        item.label.includes('Denied') || item.label.includes('Unavailable')
+                        item.label.includes('Denied') || item.label.includes('Unavailable') || item.label.includes('Timeout')
                           ? 'text-amber-400'
                           : 'text-green-400'
                       }`} />
