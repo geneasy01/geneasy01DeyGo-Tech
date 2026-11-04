@@ -736,7 +736,6 @@ export default function LandingPage() {
               <ul className="mt-4 space-y-2">
                 <li><Link href="#how-it-works" className="text-sm text-muted-foreground hover:text-foreground">How It Works</Link></li>
                 <li><Link href="#partners" className="text-sm text-muted-foreground hover:text-foreground">Partners</Link></li>
-                <li><Link href="/admin" className="text-sm text-muted-foreground hover:text-foreground">Admin</Link></li>
               </ul>
             </div>
             <div>
