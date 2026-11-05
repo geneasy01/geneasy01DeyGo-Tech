@@ -1,4 +1,4 @@
-import { supabase } from './supabase';
+import { supabase, supabaseUrl, supabaseAnonKey } from './supabase';
 import { dispatchNotification } from './notifications';
 import type {
   EmergencyIncident,
@@ -215,12 +215,10 @@ export async function getIncidentStatusHistory(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Notify Emergency Contacts (Architecture Only)
+// Notify Emergency Contacts
 // ─────────────────────────────────────────────────────────────────────────────
-// This function fetches the user's emergency contacts and prepares the
-// notification payload. When Termii/SMS is integrated, this is where the
-// actual SMS dispatch will happen. For now it logs and returns the contacts
-// so the architecture is in place.
+// Sends an SMS to every emergency contact of the user through the send-sms
+// edge function. Only contacts whose SMS was actually accepted are reported as sent.
 
 export interface ContactNotificationResult {
   contactId: string;
@@ -232,7 +230,7 @@ export interface ContactNotificationResult {
 
 export async function notifyEmergencyContacts(
   userId: string,
-  incident: EmergencyIncident
+  details: Pick<EmergencyIncident, 'emergency_type' | 'latitude' | 'longitude' | 'triggered_at'>
 ): Promise<ContactNotificationResult[]> {
   const { data: contacts, error } = await supabase
     .from('contacts')
@@ -244,19 +242,16 @@ export async function notifyEmergencyContacts(
     return [];
   }
 
-  const locationStr = incident.latitude && incident.longitude
-    ? `Location: ${incident.latitude.toFixed(4)}, ${incident.longitude.toFixed(4)}`
+  const locationStr = details.latitude && details.longitude
+    ? `Location: ${details.latitude.toFixed(4)}, ${details.longitude.toFixed(4)}`
     : 'Location: unavailable';
 
-  const message = `DEYGO Emergency Alert: ${incident.emergency_type.toUpperCase()} incident triggered by a DEYGO user who listed you as an emergency contact. ${locationStr}. Time: ${new Date(incident.triggered_at).toLocaleString()}`;
+  const message = `DEYGO Emergency Alert: ${details.emergency_type.toUpperCase()} incident triggered by a DEYGO user who listed you as an emergency contact. ${locationStr}. Time: ${new Date(details.triggered_at).toLocaleString()}`;
 
-  // Send SMS via Termii edge function (server-side, credentials in secrets)
   const smsResults = await Promise.allSettled(
     contacts.map(async (c) => {
       try {
-        const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-        const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-        if (!supabaseUrl || !supabaseKey) {
+        if (!supabaseUrl || !supabaseAnonKey) {
           console.warn('[SMS] Supabase not configured — SMS skipped');
           return { contactId: c.id, contactName: c.name, contactPhone: c.phone, message, status: 'failed' as const, error: 'Supabase not configured' };
         }
@@ -265,14 +260,15 @@ export async function notifyEmergencyContacts(
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${supabaseKey}`,
+            Authorization: `Bearer ${supabaseAnonKey}`,
           },
           body: JSON.stringify({ phone: c.phone, message }),
         });
 
-        if (!response.ok) {
-          const errText = await response.text().catch(() => 'unknown');
-          console.error(`[SMS] Failed for ${c.phone} (${response.status}):`, errText);
+        const payload = (await response.json().catch(() => null)) as { sent?: boolean; error?: string; message?: string } | null;
+        if (!response.ok || !payload?.sent) {
+          const errText = payload?.error || payload?.message || `HTTP ${response.status}`;
+          console.error(`[SMS] Failed for ${c.phone}:`, errText);
           return { contactId: c.id, contactName: c.name, contactPhone: c.phone, message, status: 'failed' as const, error: errText };
         }
 

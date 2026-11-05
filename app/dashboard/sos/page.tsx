@@ -30,9 +30,12 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
 type SOSState = 'idle' | 'countdown' | 'sending' | 'sent' | 'error';
+type GpsStatus = 'pending' | 'acquired' | 'denied' | 'timeout' | 'unavailable';
+type Coords = { lat: number; lng: number };
 
 const SOS_TIMEOUT_MS = 15000;
 const GPS_TIMEOUT_MS = 4000;
+const SAVE_RETRY_DELAY_MS = 1000;
 
 function withTimeout<T>(promise: PromiseLike<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -47,8 +50,7 @@ export default function SOSPage() {
   const { user } = useAuth();
   const [sosState, setSosState] = useState<SOSState>('idle');
   const [countdown, setCountdown] = useState(5);
-  const [location, setLocation] = useState<{ lat: number; lng: number } | null>(null);
-  const [locationStatus, setLocationStatus] = useState<'pending' | 'acquired' | 'denied' | 'timeout' | 'unavailable'>('pending');
+  const [locationStatus, setLocationStatus] = useState<GpsStatus>('pending');
   const [recentAlerts, setRecentAlerts] = useState<SOSAlert[]>([]);
   const [incidentId, setIncidentId] = useState<string | null>(null);
   const [activeIncident, setActiveIncident] = useState<EmergencyIncident | null>(null);
@@ -57,6 +59,7 @@ export default function SOSPage() {
   const [alertsLoading, setAlertsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
   const [resolving, setResolving] = useState<string | null>(null);
+  const gpsRef = useRef<{ status: GpsStatus; coords: Coords | null }>({ status: 'pending', coords: null });
   const pendingAlertIdRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -92,16 +95,21 @@ export default function SOSPage() {
     return () => { cancelled = true; };
   }, [user]);
 
+  const setGps = useCallback((status: GpsStatus, coords: Coords | null) => {
+    gpsRef.current = { status, coords };
+    setLocationStatus(status);
+  }, []);
+
   const getLocation = useCallback(() => {
-    setLocationStatus('pending');
+    setGps('pending', null);
     if (!navigator.geolocation) {
-      setLocationStatus('unavailable');
+      setGps('unavailable', null);
       return;
     }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-        setLocationStatus('acquired');
+        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setGps('acquired', coords);
 
         // If alert was already saved without location, update it now
         if (pendingAlertIdRef.current) {
@@ -110,8 +118,8 @@ export default function SOSPage() {
           supabase
             .from('sos_alerts')
             .update({
-              latitude: pos.coords.latitude,
-              longitude: pos.coords.longitude,
+              latitude: coords.lat,
+              longitude: coords.lng,
               location_status: 'acquired',
             })
             .eq('id', alertId)
@@ -121,42 +129,42 @@ export default function SOSPage() {
         }
       },
       (err) => {
-        setLocation(null);
         pendingAlertIdRef.current = null;
         if (err.code === err.PERMISSION_DENIED) {
-          setLocationStatus('denied');
+          setGps('denied', null);
         } else if (err.code === err.TIMEOUT) {
-          setLocationStatus('timeout');
+          setGps('timeout', null);
         } else {
-          setLocationStatus('unavailable');
+          setGps('unavailable', null);
         }
       },
       { enableHighAccuracy: true, timeout: GPS_TIMEOUT_MS, maximumAge: 30000 }
     );
-  }, []);
+  }, [setGps]);
 
   const startSOS = () => {
     getLocation();
     setSosState('countdown');
     setCountdown(5);
     setErrorMessage('');
+    let remaining = 5;
     timerRef.current = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          triggerSOS();
-          return 0;
-        }
-        return prev - 1;
-      });
+      remaining -= 1;
+      setCountdown(Math.max(remaining, 0));
+      if (remaining <= 0) {
+        if (timerRef.current) clearInterval(timerRef.current);
+        timerRef.current = null;
+        void triggerSOS();
+      }
     }, 1000);
   };
 
   const cancelSOS = () => {
     if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
     setSosState('idle');
     setCountdown(5);
-    setLocationStatus('pending');
+    setGps('pending', null);
     pendingAlertIdRef.current = null;
   };
 
@@ -169,22 +177,20 @@ export default function SOSPage() {
     setSosState('sending');
     setErrorMessage('');
 
-    // Determine location status for the payload
+    const gps = gpsRef.current;
     const locStatus =
-      locationStatus === 'acquired' ? 'acquired'
-      : locationStatus === 'denied' ? 'denied'
-      : locationStatus === 'unavailable' ? 'unavailable'
+      gps.status === 'acquired' ? 'acquired'
+      : gps.status === 'denied' ? 'denied'
+      : gps.status === 'unavailable' ? 'unavailable'
       : 'GPS Timeout'; // pending or timeout means GPS didn't respond in time
 
-    // Step 1: Save SOS alert immediately — no strict timeout, this is the critical path
-    let alertId: string | null = null;
-    try {
-      const { data, error } = await supabase
+    const insertAlert = () =>
+      supabase
         .from('sos_alerts')
         .insert({
           user_id: user.id,
-          latitude: location?.lat ?? null,
-          longitude: location?.lng ?? null,
+          latitude: gps.coords?.lat ?? null,
+          longitude: gps.coords?.lng ?? null,
           location_status: locStatus,
           status: 'active',
           is_duress: false,
@@ -192,8 +198,18 @@ export default function SOSPage() {
         .select()
         .single();
 
-      if (error || !data) throw new Error(error?.message || 'Failed to create SOS alert');
-      alertId = data.id;
+    // Step 1: Save SOS alert immediately — this is the critical path, so retry once on failure
+    let alertId: string | null = null;
+    try {
+      let result = await insertAlert();
+      if (result.error) {
+        await new Promise((resolve) => setTimeout(resolve, SAVE_RETRY_DELAY_MS));
+        result = await insertAlert();
+      }
+      if (result.error || !result.data) {
+        throw new Error(result.error?.message || 'Failed to create SOS alert');
+      }
+      alertId = result.data.id;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       setErrorMessage(`Failed to send SOS alert: ${msg}. Check your connection and try again.`);
@@ -205,46 +221,48 @@ export default function SOSPage() {
     setSosState('sent');
 
     // If GPS was still pending, set up late update when coordinates arrive
-    if (locationStatus === 'pending' && alertId) {
+    if (gps.status === 'pending' && alertId) {
       pendingAlertIdRef.current = alertId;
     }
 
     // Background tasks: incident creation, contact notification, history, refresh
     // These run asynchronously and do not block the success screen
     (async () => {
-      // Create emergency incident
+      let incident: EmergencyIncident | null = null;
       try {
-        const incident = await createEmergencyIncident({
+        incident = await createEmergencyIncident({
           userId: user.id,
           userEmail: user.email,
           emergencyType: 'sos',
-          latitude: location?.lat ?? null,
-          longitude: location?.lng ?? null,
+          latitude: gps.coords?.lat ?? null,
+          longitude: gps.coords?.lng ?? null,
         });
-        if (incident) {
-          setIncidentId(incident.id);
-          setActiveIncident(incident);
-
-          // Notify emergency contacts
-          try {
-            const contactResults = await notifyEmergencyContacts(user.id, incident);
-            setContactsNotified(contactResults.length);
-          } catch (err) {
-            console.error('Contact notification failed:', err);
-            setContactsNotified(0);
-          }
-
-          // Fetch status history
-          try {
-            const history = await getIncidentStatusHistory(incident.id);
-            setStatusHistory(history);
-          } catch (err) {
-            console.error('Status history fetch failed:', err);
-            setStatusHistory([]);
-          }
-        }
       } catch (err) {
         console.error('Incident creation failed:', err);
+      }
+
+      if (incident) {
+        setIncidentId(incident.id);
+        setActiveIncident(incident);
+        try {
+          setStatusHistory(await getIncidentStatusHistory(incident.id));
+        } catch (err) {
+          console.error('Status history fetch failed:', err);
+        }
+      }
+
+      // Contacts are notified even when the incident record could not be created
+      try {
+        const contactResults = await notifyEmergencyContacts(user.id, {
+          emergency_type: 'sos',
+          latitude: gps.coords?.lat ?? null,
+          longitude: gps.coords?.lng ?? null,
+          triggered_at: new Date().toISOString(),
+        });
+        setContactsNotified(contactResults.filter((r) => r.status === 'sent').length);
+      } catch (err) {
+        console.error('Contact notification failed:', err);
+        setContactsNotified(0);
       }
 
       // Refresh recent alerts list
@@ -270,7 +288,7 @@ export default function SOSPage() {
     setStatusHistory([]);
     setContactsNotified(0);
     setErrorMessage('');
-    setLocationStatus('pending');
+    setGps('pending', null);
     pendingAlertIdRef.current = null;
   };
 
@@ -477,7 +495,7 @@ export default function SOSPage() {
                     { icon: MapPin, label: locationLabel },
                     { icon: Clock, label: 'Time Logged' },
                     { icon: Bell, label: 'You Notified' },
-                    { icon: Users, label: `${contactsNotified} Contacts Prepared` },
+                    { icon: Users, label: `${contactsNotified} Contacts Notified` },
                     { icon: Activity, label: incidentId ? 'Incident Created' : 'Alert Created' },
                   ].map((item, i) => (
                     <div
