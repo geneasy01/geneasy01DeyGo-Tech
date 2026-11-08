@@ -11,6 +11,11 @@ interface SmsRequest {
   message: string;
 }
 
+function toInternationalNumber(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  return digits.startsWith("0") ? `234${digits.slice(1)}` : digits;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -51,7 +56,7 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         api_key: termiiApiKey,
-        to: phone,
+        to: toInternationalNumber(phone),
         from: termiiSender,
         sms: message,
         type: "plain",

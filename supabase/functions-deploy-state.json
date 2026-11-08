@@ -1,0 +1,21 @@
+{
+  "projectId": "68747364",
+  "functions": {
+    "admin-stats": {
+      "hasChanged": false,
+      "hash": "bb9b0dd76bb30fd8f07b645b9eaf792d7b28fa7089ccf6a70d1375433827f824"
+    },
+    "manage-subscription": {
+      "hasChanged": false,
+      "hash": "e711d0293bfcc1d74a18db1a57a2d809e402e4094bf4fa042e067b4abb8ab7e7"
+    },
+    "send-push": {
+      "hasChanged": false,
+      "hash": "9a668e5744de2e5394367ec849908c78947c30c8caf06508ea94e79e6b682579"
+    },
+    "send-sms": {
+      "hasChanged": false,
+      "hash": "8b3e07bfa1a824fa5bbc34c313db1bb003e73368d31d03dc479a5120552bc5a3"
+    }
+  }
+}
